@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.env == 'default' && 'nightly' || matrix.env }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        env: [default, stable]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          # Pinned: the committed lock file is written by 0.78.0, and an
+          # unpinned pixi rejects it as not up-to-date with the workspace.
+          pixi-version: v0.78.0
+          environments: ${{ matrix.env }}
+
+      - name: Unit tests
+        run: pixi run -e ${{ matrix.env }} test
+
+      - name: Lint (mojolint --lsp)
+        run: pixi run -e ${{ matrix.env }} lint

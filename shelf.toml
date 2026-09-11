@@ -1,0 +1,6 @@
+name = "deflate-mojo"
+version = "0.1.0"
+description = "Raw DEFLATE (RFC 1951) in pure Mojo — inflate, deflate, and inflate_at for back-to-back streams"
+tags = ["deflate", "inflate", "compression", "rfc1951", "gzip", "parquet", "avro", "codec"]
+# other tins this one depends on; omit if none
+tins = []
