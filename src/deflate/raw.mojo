@@ -328,62 +328,65 @@ def inflate_at(data: Span[UInt8, _], mut end: Int) raises -> List[UInt8]:
     while True:
         var final = br.bits(1)
         var btype = br.bits(2)
-        if btype == 0:
-            br.align()
-            if br.pos + 4 > len(br.data):
-                raise Error("avro.deflate: truncated stored block header")
-            var length = Int(br.data[br.pos]) | (Int(br.data[br.pos + 1]) << 8)
-            br.pos += 4  # LEN then its one's complement NLEN
-            if br.pos + length > len(br.data):
-                raise Error("avro.deflate: truncated stored block")
-            out.extend(br.data[br.pos : br.pos + length])
-            br.pos += length
-        elif btype == 1:
-            _inflate_block(br, fixed_lit, fixed_dist, t, out)
-        elif btype == 2:
-            var nlen = br.bits(5) + 257
-            var ndist = br.bits(5) + 1
-            var ncode = br.bits(4) + 4
-            var clen = List[Int](length=19, fill=0)
-            for i in range(ncode):
-                clen[t.clen_order[i]] = br.bits(3)
-            var ch = _Huffman(clen)
-            var lengths = List[Int](length=nlen + ndist, fill=0)
-            var i = 0
-            while i < nlen + ndist:
-                var sym = br.decode(ch)
-                if sym < 16:
-                    lengths[i] = sym
-                    i += 1
-                elif sym == 16:
-                    if i == 0:
-                        raise Error(
-                            "avro.deflate: repeat with no previous length"
-                        )
-                    var prev = lengths[i - 1]
-                    var rep = 3 + br.bits(2)
-                    for _k in range(rep):
-                        lengths[i] = prev
+        match btype:
+            case 0:
+                br.align()
+                if br.pos + 4 > len(br.data):
+                    raise Error("avro.deflate: truncated stored block header")
+                var length = Int(br.data[br.pos]) | (
+                    Int(br.data[br.pos + 1]) << 8
+                )
+                br.pos += 4  # LEN then its one's complement NLEN
+                if br.pos + length > len(br.data):
+                    raise Error("avro.deflate: truncated stored block")
+                out.extend(br.data[br.pos : br.pos + length])
+                br.pos += length
+            case 1:
+                _inflate_block(br, fixed_lit, fixed_dist, t, out)
+            case 2:
+                var nlen = br.bits(5) + 257
+                var ndist = br.bits(5) + 1
+                var ncode = br.bits(4) + 4
+                var clen = List[Int](length=19, fill=0)
+                for i in range(ncode):
+                    clen[t.clen_order[i]] = br.bits(3)
+                var ch = _Huffman(clen)
+                var lengths = List[Int](length=nlen + ndist, fill=0)
+                var i = 0
+                while i < nlen + ndist:
+                    var sym = br.decode(ch)
+                    if sym < 16:
+                        lengths[i] = sym
                         i += 1
-                elif sym == 17:
-                    var rep = 3 + br.bits(3)
-                    i += rep
-                else:
-                    var rep = 11 + br.bits(7)
-                    i += rep
-            if i > nlen + ndist:
-                raise Error("avro.deflate: code-length overflow")
-            var lit_lengths = List[Int](capacity=nlen)
-            for k in range(nlen):
-                lit_lengths.append(lengths[k])
-            var dist_lengths = List[Int](capacity=ndist)
-            for k in range(ndist):
-                dist_lengths.append(lengths[nlen + k])
-            var lh = _Huffman(lit_lengths)
-            var dh = _Huffman(dist_lengths)
-            _inflate_block(br, lh, dh, t, out)
-        else:
-            raise Error("avro.deflate: reserved block type 3")
+                    elif sym == 16:
+                        if i == 0:
+                            raise Error(
+                                "avro.deflate: repeat with no previous length"
+                            )
+                        var prev = lengths[i - 1]
+                        var rep = 3 + br.bits(2)
+                        for _k in range(rep):
+                            lengths[i] = prev
+                            i += 1
+                    elif sym == 17:
+                        var rep = 3 + br.bits(3)
+                        i += rep
+                    else:
+                        var rep = 11 + br.bits(7)
+                        i += rep
+                if i > nlen + ndist:
+                    raise Error("avro.deflate: code-length overflow")
+                var lit_lengths = List[Int](capacity=nlen)
+                for k in range(nlen):
+                    lit_lengths.append(lengths[k])
+                var dist_lengths = List[Int](capacity=ndist)
+                for k in range(ndist):
+                    dist_lengths.append(lengths[nlen + k])
+                var lh = _Huffman(lit_lengths)
+                var dh = _Huffman(dist_lengths)
+                _inflate_block(br, lh, dh, t, out)
+            case _:
+                raise Error("avro.deflate: reserved block type 3")
         if final:
             break
     # `br.pos` is the next byte not yet pulled into the bit buffer, so whole
