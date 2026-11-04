@@ -1,5 +1,5 @@
 name = "deflate-mojo"
-version = "0.1.2"
+version = "0.1.3"
 description = "DEFLATE (RFC 1951) and gzip (RFC 1952) in pure Mojo — inflate, deflate, gunzip (multi-member, CRC-checked) and gzip"
 tags = ["deflate", "inflate", "compression", "rfc1951", "gzip", "parquet", "avro", "codec"]
 # other tins this one depends on; omit if none
