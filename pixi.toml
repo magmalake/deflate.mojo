@@ -3,13 +3,13 @@ authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "deflate.mojo"
 version = "0.1.2"
-description = "Raw DEFLATE (RFC 1951) in pure Mojo — inflate and deflate, no FFI."
+description = "DEFLATE (RFC 1951) and gzip (RFC 1952) in pure Mojo — inflate, deflate, gunzip and gzip, no FFI."
 preview = ["pixi-build"]
 platforms = ["osx-arm64", "linux-64"]
 
 [tasks]
 # Pure Mojo, no FFI, no external imports — consumers just `-I ../deflate.mojo/src`.
-test = "mojo run -I src tests/test_deflate.mojo"
+test = "mojo run -I src tests/test_deflate.mojo && mojo run -I src tests/test_gzip.mojo"
 
 # mojolint (lint-mojo, below): the origin and threading mistakes the compiler
 # lets through, with mojo-lsp-server behind the rules. Exit 1 on findings.

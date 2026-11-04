@@ -254,14 +254,20 @@ struct _Out(Copyable, Defaultable, Movable, Sized):
 
     var buf: List[UInt8]
     var n: Int
+    var base: Int
+    """Where the stream being decoded began. A back-reference may not reach
+    before it, so several streams can share one window (`gunzip` decodes
+    every member into the same buffer) without one reading another's bytes."""
 
     def __init__(out self):
         self.buf = List[UInt8]()
         self.n = 0
+        self.base = 0
 
     def __init__(out self, capacity: Int):
         self.buf = List[UInt8](length=capacity, fill=0)
         self.n = 0
+        self.base = 0
 
     def __len__(self) -> Int:
         return self.n
@@ -321,6 +327,16 @@ def inflate_at(data: Span[UInt8, _], mut end: Int) raises -> List[UInt8]:
     callers that do not can use `inflate`.
     """
     var out = _Out(len(data) * 3 + 64)
+    _inflate_into(data, end, out)
+    return out^.finish()
+
+
+def _inflate_into(data: Span[UInt8, _], mut end: Int, mut out: _Out) raises:
+    """`inflate_at`, appending to `out` rather than to a fresh buffer.
+
+    Back-references may reach back to `out.n` at the call, not before: what
+    `out` already holds belongs to an earlier stream."""
+    out.base = out.n
     var t = _Tables()
     var br = _BitReader(data)
     var fixed_lit = _Huffman(_fixed_literal_lengths())
@@ -392,7 +408,6 @@ def inflate_at(data: Span[UInt8, _], mut end: Int) raises -> List[UInt8]:
     # `br.pos` is the next byte not yet pulled into the bit buffer, so whole
     # bytes still sitting in that buffer have not actually been consumed.
     end = br.pos - br.bitcnt // 8
-    return out^.finish()
 
 
 def _inflate_block(
@@ -420,7 +435,7 @@ def _inflate_block(
             if dc >= 30:
                 raise Error("avro.deflate: invalid distance symbol")
             var d = t.dist_base[dc] + br.bits(t.dist_extra[dc])
-            if d > len(out):
+            if d > out.n - out.base:
                 raise Error(
                     "avro.deflate: distance runs before the output start"
                 )
