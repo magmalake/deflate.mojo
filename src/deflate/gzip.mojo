@@ -15,7 +15,7 @@ tin keeps no sibling dependency: a consumer still needs nothing but
 from std.sys import llvm_intrinsic
 from std.sys.info import CompilationTarget
 
-from deflate.raw import _inflate_into, _Out, deflate
+from deflate.raw import Inflater, InflateStatus, _is_short, deflate
 
 # ── CRC-32 ─────────────────────────────────────────────────────────────────
 
@@ -157,73 +157,267 @@ def _skip_zstring(
 
 
 def _header_end(
-    data: Span[UInt8, _], start: Int, member: Int, crc: _Crc32
+    data: Span[UInt8, _], start: Int, member: Int, crc: _Crc32, shown: Int
 ) raises -> Int:
     """Parse the member header at `start`; return where its DEFLATE body
     begins. Every optional field is bounds-checked, and FHCRC is verified."""
     var n = len(data)
     if start + 10 > n:
-        raise _err(member, start, "truncated header")
+        raise _err(member, shown, "truncated header")
     if data[start] != _ID1 or data[start + 1] != _ID2:
-        raise _err(member, start, "not a gzip stream (bad magic)")
+        raise _err(member, shown, "not a gzip stream (bad magic)")
     if data[start + 2] != _CM_DEFLATE:
         raise _err(
             member,
-            start,
+            shown,
             String("unknown compression method ", Int(data[start + 2])),
         )
     var flg = Int(data[start + 3])
     if flg & _FRESERVED:
-        raise _err(member, start, String("reserved flag bits set: ", flg))
+        raise _err(member, shown, String("reserved flag bits set: ", flg))
     var i = start + 10
     if flg & _FEXTRA:
         if i + 2 > n:
-            raise _err(member, start, "truncated header (FEXTRA length)")
+            raise _err(member, shown, "truncated header (FEXTRA length)")
         var xlen = Int(data[i]) | (Int(data[i + 1]) << 8)
         i += 2 + xlen
         if i > n:
-            raise _err(member, start, "truncated header (FEXTRA)")
+            raise _err(member, shown, "truncated header (FEXTRA)")
     if flg & _FNAME:
-        i = _skip_zstring(data, i, member, start, "FNAME")
+        i = _skip_zstring(data, i, member, shown, "FNAME")
     if flg & _FCOMMENT:
-        i = _skip_zstring(data, i, member, start, "FCOMMENT")
+        i = _skip_zstring(data, i, member, shown, "FCOMMENT")
     if flg & _FHCRC:
         if i + 2 > n:
-            raise _err(member, start, "truncated header (FHCRC)")
+            raise _err(member, shown, "truncated header (FHCRC)")
         var want = Int(data[i]) | (Int(data[i + 1]) << 8)
         var got = Int(crc.update(0, data[start:i]) & 0xFFFF)
         if got != want:
-            raise _err(member, start, "header CRC (FHCRC) mismatch")
+            raise _err(member, shown, "header CRC (FHCRC) mismatch")
         i += 2
     return i
 
 
-def _member(
-    data: Span[UInt8, _],
-    start: Int,
-    member: Int,
-    crc: _Crc32,
-    mut out: _Out,
-) raises -> Int:
-    """Decode the member at `start` onto the end of `out`, check its trailer,
-    and return the offset just past it."""
-    var body = _header_end(data, start, member, crc)
-    var first = out.n
-    var used = 0
-    try:
-        _inflate_into(data[body:], used, out)
-    except e:
-        raise _err(member, start, String(e))
-    var tail = body + used
-    if tail + 8 > len(data):
-        raise _err(member, start, "truncated trailer (CRC-32 and ISIZE)")
-    var produced = out.n - first
-    var got = crc.update(0, Span(out.buf)[first : out.n])
-    if got != _u32le(data, tail):
-        raise _err(member, start, "CRC-32 mismatch")
-    if UInt32(produced & 0xFFFFFFFF) != _u32le(data, tail + 4):
-        raise _err(member, start, "ISIZE mismatch")
-    return tail + 8
+# ── the streaming reader ───────────────────────────────────────────────────
+
+comptime _HEADER = 0
+comptime _BODY = 1
+comptime _TRAILER = 2
+comptime _BETWEEN = 3
+comptime _PADDING = 4
+comptime _END = 5
+
+
+struct GzipReader(Movable, Sized):
+    """A gzip file decoded a window at a time: every member of it, or just
+    the first.
+
+    The streaming form of `gunzip`, over `Inflater`: `run` decodes until the
+    window (`output()`) holds `want` bytes, the input runs short or the file
+    ends; `compact` drops what the caller has used. The input may still be
+    arriving, and input already consumed may be discarded, exactly as for
+    `Inflater`. Headers, CRC-32s and ISIZEs are checked as `gunzip` checks
+    them, with the same messages; the CRC is folded in as output is
+    produced, so it covers bytes long since compacted away.
+
+    ```mojo
+    var gz = GzipReader()
+    var have = 0  # how much of `data` has arrived
+    while True:
+        var st = gz.run(Span(data)[:have], have == len(data), len(gz) + (1 << 20))
+        parse(gz.output())
+        _ = gz.compact(len(gz))
+        if st == InflateStatus.FINISHED:
+            break
+        if st == InflateStatus.NEED_INPUT:
+            have = ...  # wait for more
+    ```
+    """
+
+    var inflater: Inflater
+    """Holds the window and the DEFLATE state of the member being decoded."""
+    var state: Int
+    var multi_member: Bool
+    var member: Int
+    var member_at: Int
+    """Absolute input offset of the current member's header (for messages)."""
+    var crc32: _Crc32
+    var crc: UInt32
+    var crc_at: Int
+    """`output()[crc_at:]` is not in `crc` yet."""
+    var member_out: Int
+    var padding_at: Int
+
+    def __init__(
+        out self, capacity: Int = 1 << 20, multi_member: Bool = True
+    ) raises:
+        """`capacity` is the window's starting size. With `multi_member`
+        false, decoding stops after the first member, and whatever follows
+        it is left alone (`input_used()` says where it ended)."""
+        self.inflater = Inflater(capacity)
+        self.state = _HEADER
+        self.multi_member = multi_member
+        self.member = 0
+        self.member_at = 0
+        self.crc32 = _Crc32()
+        self.crc = 0
+        self.crc_at = 0
+        self.member_out = 0
+        self.padding_at = 0
+
+    # ── window and input, as for `Inflater` ──
+
+    @always_inline
+    def output(self) -> Span[UInt8, origin_of(self.inflater.out.buf)]:
+        """Everything decoded and not yet compacted away."""
+        return Span(self.inflater.out.buf)[: self.inflater.out.n]
+
+    @always_inline
+    def __len__(self) -> Int:
+        return self.inflater.out.n
+
+    def compact(mut self, keep_from: Int) -> Int:
+        """`Inflater.compact`: drop `output()[0:keep_from]` as far as
+        back-references allow; return how many bytes went."""
+        self._sum()
+        var drop = self.inflater.compact(keep_from)
+        self.crc_at -= drop
+        return drop
+
+    def total_out(self) -> Int:
+        return self.inflater.total_out()
+
+    def members(self) -> Int:
+        """Members decoded and verified so far."""
+        return self.member
+
+    def finished(self) -> Bool:
+        return self.state == _END
+
+    def finish(deinit self) -> List[UInt8]:
+        """The window as a list, consuming the reader."""
+        return self.inflater^.finish()
+
+    def input_used(self) -> Int:
+        """How many bytes of `data` the reader is done with; once finished,
+        the offset just past the last trailer it read (or padding)."""
+        return self.inflater.input_used()
+
+    def discard_input(mut self) -> Int:
+        """`Inflater.discard_input`: forget the input before `input_used()`
+        and return how many bytes that is."""
+        return self.inflater.discard_input()
+
+    def total_in(self) -> Int:
+        return self.inflater.total_in()
+
+    # ── decoding ──
+
+    def _sum(mut self):
+        var n = self.inflater.out.n
+        if n > self.crc_at:
+            self.crc = self.crc32.update(
+                self.crc, Span(self.inflater.out.buf)[self.crc_at : n]
+            )
+            self.member_out += n - self.crc_at
+            self.crc_at = n
+
+    def run(
+        mut self,
+        data: Span[UInt8, _],
+        complete: Bool,
+        want: Int = Int.MAX,
+    ) raises -> InflateStatus:
+        """Decode from `data` until the window holds `want` bytes: `OUTPUT`,
+        `NEED_INPUT` or `FINISHED`, as `Inflater.run`. Raises what `gunzip`
+        raises, once `complete` says no more input is coming (and on
+        corruption before that)."""
+        var result = InflateStatus.OUTPUT
+        while self.inflater.out.n < want:
+            var at = self.inflater.pos
+            var shown = self.inflater.dropped_in + at
+            if self.state == _HEADER:
+                if complete and self.member == 0 and at >= len(data):
+                    raise Error("gunzip: empty input")
+                var body: Int
+                try:
+                    body = _header_end(data, at, self.member, self.crc32, shown)
+                except e:
+                    if complete or not _is_short(e):
+                        raise e^
+                    result = InflateStatus.NEED_INPUT
+                    break
+                self.member_at = shown
+                self.inflater._begin(body)
+                self.crc = 0
+                self.crc_at = self.inflater.out.n
+                self.member_out = 0
+                self.state = _BODY
+            elif self.state == _BODY:
+                var st: InflateStatus
+                try:
+                    st = self.inflater.run(data, complete, want)
+                except e:
+                    raise _err(self.member, self.member_at, String(e))
+                if self.inflater.finished():
+                    self.state = _TRAILER
+                elif st == InflateStatus.NEED_INPUT:
+                    result = st
+                    break
+            elif self.state == _TRAILER:
+                if at + 8 > len(data):
+                    if complete:
+                        raise _err(
+                            self.member,
+                            self.member_at,
+                            "truncated trailer (CRC-32 and ISIZE)",
+                        )
+                    result = InflateStatus.NEED_INPUT
+                    break
+                self._sum()
+                if self.crc != _u32le(data, at):
+                    raise _err(self.member, self.member_at, "CRC-32 mismatch")
+                if UInt32(self.member_out & 0xFFFFFFFF) != _u32le(data, at + 4):
+                    raise _err(self.member, self.member_at, "ISIZE mismatch")
+                self.inflater.pos = at + 8
+                self.member += 1
+                self.state = _BETWEEN if self.multi_member else _END
+            elif self.state == _BETWEEN:
+                # Another member, zero padding, or the end of the file.
+                if at >= len(data):
+                    if not complete:
+                        result = InflateStatus.NEED_INPUT
+                        break
+                    self.state = _END
+                elif data[at] == _ID1:
+                    self.state = _HEADER
+                else:
+                    self.padding_at = shown
+                    self.state = _PADDING
+            elif self.state == _PADDING:
+                var k = at
+                while k < len(data) and data[k] == 0:
+                    k += 1
+                self.inflater.pos = k
+                if k < len(data):
+                    raise Error(
+                        String(
+                            "gunzip: trailing garbage after member ",
+                            self.member - 1,
+                            " at byte ",
+                            self.padding_at,
+                        )
+                    )
+                if not complete:
+                    result = InflateStatus.NEED_INPUT
+                    break
+                self.state = _END
+            else:
+                break
+        self._sum()
+        if self.state == _END:
+            return InflateStatus.FINISHED
+        return result
 
 
 # ── public API ─────────────────────────────────────────────────────────────
@@ -237,8 +431,6 @@ def gunzip(data: Span[UInt8, _]) raises -> List[UInt8]:
     there raises, as does an empty input.
     """
     var n = len(data)
-    if n == 0:
-        raise Error("gunzip: empty input")
     # The last four bytes are the final member's ISIZE: for the usual
     # one-member file, the exact output size. 1032:1 is DEFLATE's ceiling, so
     # a larger claim is corruption, not a reason to allocate.
@@ -247,26 +439,9 @@ def gunzip(data: Span[UInt8, _]) raises -> List[UInt8]:
         var isize = Int(_u32le(data, n - 4))
         if isize <= n * 1032:
             hint = isize + 64
-    var out = _Out(hint)
-    var crc = _Crc32()
-    var pos = 0
-    var member = 0
-    while True:
-        pos = _member(data, pos, member, crc, out)
-        member += 1
-        if pos >= n:
-            break
-        if data[pos] != _ID1:
-            var k = pos
-            while k < n and data[k] == 0:
-                k += 1
-            if k == n:
-                break
-            raise Error(
-                String("gunzip: trailing garbage after member ", member - 1,
-                    " at byte ", pos)
-            )
-    return out^.finish()
+    var gz = GzipReader(hint)
+    _ = gz.run(data, complete=True)
+    return gz^.finish()
 
 
 def gunzip_at(data: Span[UInt8, _], mut end: Int) raises -> List[UInt8]:
@@ -287,10 +462,10 @@ def gunzip_at(data: Span[UInt8, _], mut end: Int) raises -> List[UInt8]:
     # No ISIZE to size the buffer from until the member is decoded; start
     # modest and let the window double rather than reserve 3x the rest of a
     # possibly huge multi-member file per member.
-    var out = _Out(min(len(data) * 3 + 64, 1 << 22))
-    var crc = _Crc32()
-    end = _member(data, 0, 0, crc, out)
-    return out^.finish()
+    var gz = GzipReader(min(len(data) * 3 + 64, 1 << 22), multi_member=False)
+    _ = gz.run(data, complete=True)
+    end = gz.input_used()
+    return gz^.finish()
 
 
 def gzip(data: Span[UInt8, _], level: Int = 6) raises -> List[UInt8]:
