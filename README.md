@@ -77,9 +77,27 @@ The CRC-32 uses the Arm CRC32 instructions where the build target has them
 and a slice-by-8 table elsewhere (x86, and builds whose `mojo` resolved no
 CPU).
 
-On an Apple M4, `gunzip` decodes a GH Archive hour (94 MB compressed, 670 MB
-of JSON) in 0.78 s, about 860 MB/s of output; Python's `zlib.decompress`
-takes 0.73 s and Apple's `gzip -d` 0.31 s.
+### Speed
+
+On an Apple M4, `gunzip` decodes a GH Archive hour (2025-01-01-0: 70 MB
+compressed, 492 MB of JSON) in 0.34 s, about 1.4 GB/s of output, CRC-32
+included; streamed through a 16 MiB `GzipReader` window it takes the same.
+For comparison, on the same file: Python's `zlib.decompress` (zlib 1.3.2)
+0.54 s, Apple's `gzip -dc` 0.23 s, and libdeflate 1.26's whole-buffer
+`libdeflate_gzip_decompress` 0.20 s.
+
+The decode loop refills a 64-bit bit buffer once per symbol with one
+unaligned load, unchecked while eight bytes of input remain (enough bits
+for a length, a distance and their extra bits); takes further literals from
+the same refill; looks codes up in a 10-bit table whose entries carry a
+length's or distance's base and extra-bit count, as libdeflate's do; and
+copies matches 16 or 8 bytes at a time. Dynamic blocks rebuild their tables
+in place, and nothing is built for a block type the stream does not use,
+so a one-shot call on a small input costs about 5 µs.
+
+There is no libdeflate backend: this tin is pure Mojo with no dependencies
+on purpose, so consumers need nothing but `-I deflate.mojo/src`. A
+libdeflate binding would be a separate tin.
 
 ### Streaming
 

@@ -10,6 +10,15 @@ Python's `zlib.compressobj(..., wbits=-15)`, one per block type.
 from std.testing import TestSuite, assert_equal, assert_true
 
 from deflate import deflate, inflate, inflate_at
+from deflate.raw import (
+    _CLEN_ORDER_S,
+    _DIST_BASE_S,
+    _DIST_EXTRA_S,
+    _LEN_BASE_S,
+    _LEN_EXTRA_S,
+    _Tables,
+    _ints,
+)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -173,6 +182,22 @@ def test_garbage_block_type_raises() raises:
     except:
         raised = True
     assert_true(raised, "reserved block type should raise")
+
+
+def _same(got: List[Int], want: List[Int], name: StringSlice) raises:
+    assert_equal(len(got), len(want), String(name, ": length"))
+    for k in range(len(want)):
+        assert_equal(got[k], want[k], String(name, ": entry ", k))
+
+
+def test_generated_tables_match_rfc_1951() raises:
+    """`_Tables` computes RFC 1951's tables; they equal the spelled-out text."""
+    var t = _Tables()
+    _same(t.len_base, _ints(_LEN_BASE_S), "length base")
+    _same(t.len_extra, _ints(_LEN_EXTRA_S), "length extra")
+    _same(t.dist_base, _ints(_DIST_BASE_S), "distance base")
+    _same(t.dist_extra, _ints(_DIST_EXTRA_S), "distance extra")
+    _same(t.clen_order, _ints(_CLEN_ORDER_S), "code-length order")
 
 
 def main() raises:
