@@ -9,7 +9,7 @@ platforms = ["osx-arm64", "linux-64"]
 
 [tasks]
 # Pure Mojo, no FFI, no external imports — consumers just `-I ../deflate.mojo/src`.
-test = "mojo run -I src tests/test_deflate.mojo && mojo run -I src tests/test_gzip.mojo"
+test = "mojo run -I src tests/test_deflate.mojo && mojo run -I src tests/test_gzip.mojo && mojo run -I src tests/test_stream.mojo"
 
 # mojolint (lint-mojo, below): the origin and threading mistakes the compiler
 # lets through, with mojo-lsp-server behind the rules. Exit 1 on findings.

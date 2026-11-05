@@ -115,7 +115,7 @@ struct _Huffman(Copyable, Defaultable, Movable):
             left <<= 1
             left -= self.counts[n]
             if left < 0:
-                raise Error("avro.deflate: over-subscribed Huffman code")
+                raise Error("inflate: over-subscribed Huffman code")
         var offs = List[Int](length=16, fill=0)
         for n in range(1, 15):
             offs[n + 1] = offs[n] + self.counts[n]
@@ -189,7 +189,7 @@ struct _BitReader[origin: ImmOrigin](Copyable, Movable):
         if self.bitcnt < need:
             self.refill()
             if self.bitcnt < need:
-                raise Error("avro.deflate: truncated DEFLATE stream")
+                raise Error("inflate: truncated DEFLATE stream")
         var v = Int(self.bitbuf & ((UInt64(1) << UInt64(need)) - 1))
         self.bitbuf >>= UInt64(need)
         self.bitcnt -= need
@@ -211,7 +211,7 @@ struct _BitReader[origin: ImmOrigin](Copyable, Movable):
         if e >= 0:
             var n = e >> 16
             if n > self.bitcnt:
-                raise Error("avro.deflate: truncated DEFLATE stream")
+                raise Error("inflate: truncated DEFLATE stream")
             self.bitbuf >>= UInt64(n)
             self.bitcnt -= n
             return e & 0xFFFF
@@ -231,7 +231,7 @@ struct _BitReader[origin: ImmOrigin](Copyable, Movable):
             index += count
             first = (first + count) << 1
             code <<= 1
-        raise Error("avro.deflate: invalid Huffman code")
+        raise Error("inflate: invalid Huffman code")
 
 
 def _fixed_literal_lengths() -> List[Int]:
@@ -241,6 +241,21 @@ def _fixed_literal_lengths() -> List[Int]:
     for i in range(256, 280):
         l[i] = 7
     return l^
+
+
+comptime _WINDOW: Int = 32768
+"""How far back a DEFLATE back-reference can reach: what `compact` keeps."""
+
+comptime _SLACK: Int = 258 + 8
+"""Room kept free past the write position before each symbol: the longest
+match, plus the overshoot of the eight-byte match copy."""
+
+comptime MARGIN: Int = 1 << 18
+"""The input a block is started with when more is still to come (`run` with
+`complete=False`). zlib ends a block every 16 Ki or 32 Ki symbols, at most
+about 200 KB of input, so with 256 KiB in hand a block almost never runs
+past what has arrived; one that does is rolled back and decoded again once
+more input is there."""
 
 
 struct _Out(Copyable, Defaultable, Movable, Sized):
@@ -257,7 +272,8 @@ struct _Out(Copyable, Defaultable, Movable, Sized):
     var base: Int
     """Where the stream being decoded began. A back-reference may not reach
     before it, so several streams can share one window (`gunzip` decodes
-    every member into the same buffer) without one reading another's bytes."""
+    every member into the same buffer) without one reading another's bytes.
+    0 once `compact` has moved the window past it."""
 
     def __init__(out self):
         self.buf = List[UInt8]()
@@ -265,7 +281,7 @@ struct _Out(Copyable, Defaultable, Movable, Sized):
         self.base = 0
 
     def __init__(out self, capacity: Int):
-        self.buf = List[UInt8](length=capacity, fill=0)
+        self.buf = List[UInt8](length=max(capacity, 64), fill=0)
         self.n = 0
         self.base = 0
 
@@ -290,26 +306,352 @@ struct _Out(Copyable, Defaultable, Movable, Sized):
         self.n += 1
 
     def extend(mut self, src: Span[UInt8, _]):
-        self.room(len(src))
+        self.room(len(src) + _SLACK)
+        var p = self.buf.unsafe_ptr()
         for k in range(len(src)):
-            self.buf[self.n + k] = src[k]
+            p[unsafe_offset=self.n + k] = src[k]
         self.n += len(src)
 
     @always_inline
     def copy_match(mut self, distance: Int, length: Int):
-        """LZ77 back-reference. Forward and byte at a time, because an
-        overlapping copy (`distance < length`) is how DEFLATE spells a run."""
+        """LZ77 back-reference, forward, because an overlapping copy
+        (`distance < length`) is how DEFLATE spells a run.
+
+        When the source is at least eight bytes behind, eight bytes move at
+        a time: each load then reads only bytes already written, and the
+        copy may run up to seven bytes past the match, into the slack that
+        `room` keeps. Closer than that, it goes byte by byte."""
         var at = self.n
         var start = at - distance
         var p = self.buf.unsafe_ptr()
-        for k in range(length):
-            p[unsafe_offset=at + k] = p[unsafe_offset=start + k]
+        if distance >= 8:
+            var k = 0
+            while k < length:
+                var v = (
+                    p.unsafe_offset(start + k)
+                    .unsafe_bitcast[UInt64]()
+                    .unsafe_load[alignment=1]()
+                )
+                p.unsafe_offset(at + k).unsafe_bitcast[UInt64]().unsafe_store[
+                    alignment=1
+                ](v)
+                k += 8
+        else:
+            for k in range(length):
+                p[unsafe_offset=at + k] = p[unsafe_offset=start + k]
         self.n = at + length
+
+    def compact(mut self, keep_from: Int) -> Int:
+        """Drop `buf[0:keep_from]`, keeping the last `_WINDOW` bytes however
+        small `keep_from` is; return how many bytes went."""
+        var drop = min(keep_from, self.n - _WINDOW)
+        if drop <= 0:
+            return 0
+        var p = self.buf.unsafe_ptr()
+        var keep = self.n - drop
+        # Overlapping, toward the front: a forward copy is safe.
+        for k in range(keep):
+            p[unsafe_offset=k] = p[unsafe_offset=drop + k]
+        self.n = keep
+        self.base = max(self.base - drop, 0)
+        return drop
 
     def finish(deinit self) -> List[UInt8]:
         var buf = self.buf^
         buf.resize(self.n, 0)
         return buf^
+
+
+# ── the streaming inflater ─────────────────────────────────────────────────
+
+
+@fieldwise_init
+struct InflateStatus(Equatable, TrivialRegisterPassable, Writable):
+    """Why `Inflater.run` or `GzipReader.run` returned."""
+
+    var value: Int
+
+    comptime OUTPUT = InflateStatus(0)
+    """The window holds the output asked for (`n >= want`)."""
+    comptime NEED_INPUT = InflateStatus(1)
+    """More input is needed before anything more can be decoded."""
+    comptime FINISHED = InflateStatus(2)
+    """The stream (every gzip member) has been decoded and checked."""
+
+    def __eq__(self, other: Self) -> Bool:
+        return self.value == other.value
+
+    def write_to(self, mut writer: Some[Writer]):
+        if self.value == 0:
+            writer.write("OUTPUT")
+        elif self.value == 1:
+            writer.write("NEED_INPUT")
+        else:
+            writer.write("FINISHED")
+
+
+comptime _BLOCKS = 0
+comptime _DONE = 1
+
+
+def _is_short(e: Error) -> Bool:
+    """Whether `e` is the decoder running out of input (which more input
+    may cure) rather than the input being wrong."""
+    return "truncated" in String(e)
+
+
+struct Inflater(Movable, Sized):
+    """A raw DEFLATE stream decoded a window at a time.
+
+    The output collects in a window, `output()`. `run` decodes
+    blocks until the window holds `want` bytes, the input runs short or the
+    stream ends; the caller uses what is there, then `compact`s away what it
+    no longer needs. The window keeps the last 32 KiB whatever is dropped,
+    since later back-references may reach that far.
+
+    The input may still be arriving. `run` takes the input so far and
+    whether that is all of it; a block that runs past the bytes there is
+    rolled back to its start and decoded again on a later call, with more.
+    The caller may drop input the inflater has finished with: see
+    `discard_input`.
+
+    ```mojo
+    var inf = Inflater()
+    while True:
+        var st = inf.run(Span(input), complete, want=len(inf) + (1 << 20))
+        use(inf.output())
+        _ = inf.compact(len(inf))
+        if st == InflateStatus.FINISHED:
+            break
+        if st == InflateStatus.NEED_INPUT:
+            ...  # append more to `input` (or set complete)
+    ```
+
+    `inflate` and `inflate_at` are this with the whole input and a window
+    that is never compacted.
+    """
+
+    var out: _Out
+    var pos: Int
+    """The next input byte not yet in the bit buffer, as an offset into the
+    `data` passed to `run`."""
+    var bitbuf: UInt64
+    var bitcnt: Int
+    var state: Int
+    var margin: Int
+    """Input to have in hand before starting a block while more is still to
+    come (`MARGIN`). 0 starts every block at once and rolls back each one
+    that outruns the input, which tests use."""
+    var dropped_in: Int
+    """Input bytes `discard_input` has released: what `pos` is relative to."""
+    var dropped_out: Int
+    """Output bytes `compact` has dropped."""
+    var t: _Tables
+    var fixed_lit: _Huffman
+    var fixed_dist: _Huffman
+
+    def __init__(out self, capacity: Int = 1 << 20) raises:
+        """`capacity` is the window's starting size; it grows as needed."""
+        self.out = _Out(capacity + _SLACK)
+        self.pos = 0
+        self.bitbuf = 0
+        self.bitcnt = 0
+        self.state = _BLOCKS
+        self.margin = MARGIN
+        self.dropped_in = 0
+        self.dropped_out = 0
+        self.t = _Tables()
+        self.fixed_lit = _Huffman(_fixed_literal_lengths())
+        self.fixed_dist = _Huffman(List[Int](length=30, fill=5))
+
+    # ── window ──
+
+    @always_inline
+    def output(self) -> Span[UInt8, origin_of(self.out.buf)]:
+        """The window: everything decoded and not yet compacted away."""
+        return Span(self.out.buf)[: self.out.n]
+
+    @always_inline
+    def __len__(self) -> Int:
+        """`len(output())`."""
+        return self.out.n
+
+    def compact(mut self, keep_from: Int) -> Int:
+        """Drop `output()[0:keep_from]`, as far as back-references allow,
+        and return how many bytes went: subtract it from any offsets into
+        the window the caller holds."""
+        var drop = self.out.compact(keep_from)
+        self.dropped_out += drop
+        return drop
+
+    def total_out(self) -> Int:
+        """Bytes decoded so far, compacted or not."""
+        return self.dropped_out + self.out.n
+
+    def finished(self) -> Bool:
+        """Whether the final block has been decoded."""
+        return self.state == _DONE
+
+    def finish(deinit self) -> List[UInt8]:
+        """The window as a list (trimmed to `n`), consuming the inflater."""
+        return self.out^.finish()
+
+    # ── input ──
+
+    def input_used(self) -> Int:
+        """How many bytes of `data` the inflater is done with. Once the
+        stream has finished this is where it ended (rounded up to a byte),
+        as `inflate_at` reports."""
+        return self.pos - self.bitcnt // 8
+
+    def discard_input(mut self) -> Int:
+        """Forget the input before `input_used()` and return how many bytes
+        that is: the next `run` must be passed `data` without them. A long
+        stream can then be fed through a bounded input buffer."""
+        var k = self.input_used()
+        # Whole bytes still in the bit buffer are given back, so `pos` can
+        # stay a plain offset.
+        self.pos = k
+        self.bitbuf &= (UInt64(1) << UInt64(self.bitcnt % 8)) - 1
+        self.bitcnt %= 8
+        self.pos -= k
+        self.dropped_in += k
+        return k
+
+    def total_in(self) -> Int:
+        """Input consumed so far, discarded or not."""
+        return self.dropped_in + self.input_used()
+
+    def _begin(mut self, at: Int):
+        """Start a fresh stream at `data[at]`, appending to the window."""
+        self.pos = at
+        self.bitbuf = 0
+        self.bitcnt = 0
+        self.state = _BLOCKS
+        self.out.base = self.out.n
+
+    # ── decoding ──
+
+    def run(
+        mut self,
+        data: Span[UInt8, _],
+        complete: Bool,
+        want: Int = Int.MAX,
+    ) raises -> InflateStatus:
+        """Decode from `data` (the input so far, from where the last call
+        left off unless `discard_input` said otherwise; all of it if
+        `complete`) until the window holds `want` bytes.
+
+        Returns `OUTPUT` when it does, `NEED_INPUT` when a block is waiting
+        for more input than `data` has, or `FINISHED` after the final block.
+        Raises on corrupt input, and on input that ends early once
+        `complete` is set."""
+        while self.out.n < want:
+            if self.state == _DONE:
+                return InflateStatus.FINISHED
+            if not complete and len(data) - self.pos < self.margin:
+                return InflateStatus.NEED_INPUT
+            var s_pos = self.pos
+            var s_buf = self.bitbuf
+            var s_cnt = self.bitcnt
+            var s_n = self.out.n
+            var final: Bool
+            try:
+                final = self._block(data)
+            except e:
+                if complete or not _is_short(e):
+                    raise e^
+                self.pos = s_pos
+                self.bitbuf = s_buf
+                self.bitcnt = s_cnt
+                self.out.n = s_n
+                return InflateStatus.NEED_INPUT
+            if final:
+                self.state = _DONE
+        if self.state == _DONE:
+            return InflateStatus.FINISHED
+        return InflateStatus.OUTPUT
+
+    def _block(mut self, data: Span[UInt8, _]) raises -> Bool:
+        """One block onto the window; whether it was the final one."""
+        var br = _BitReader(data)
+        br.pos = self.pos
+        br.bitbuf = self.bitbuf
+        br.bitcnt = self.bitcnt
+        var final = br.bits(1) == 1
+        var btype = br.bits(2)
+        if btype == 0:
+            br.align()
+            if br.pos + 4 > len(br.data):
+                raise Error("inflate: truncated stored block header")
+            var length = Int(br.data[br.pos]) | (Int(br.data[br.pos + 1]) << 8)
+            var nlen = Int(br.data[br.pos + 2]) | (
+                Int(br.data[br.pos + 3]) << 8
+            )
+            if length != (~nlen & 0xFFFF):
+                raise Error("inflate: stored block length check failed")
+            br.pos += 4
+            if br.pos + length > len(br.data):
+                raise Error("inflate: truncated stored block")
+            self.out.extend(br.data[br.pos : br.pos + length])
+            br.pos += length
+        elif btype == 1:
+            _inflate_block(br, self.fixed_lit, self.fixed_dist, self.t, self.out)
+        elif btype == 2:
+            var nlen = br.bits(5) + 257
+            var ndist = br.bits(5) + 1
+            var ncode = br.bits(4) + 4
+            if nlen > 286 or ndist > 30:
+                raise Error("inflate: too many length or distance codes")
+            var clen = List[Int](length=19, fill=0)
+            for i in range(ncode):
+                clen[self.t.clen_order[i]] = br.bits(3)
+            var ch = _Huffman(clen)
+            var total = nlen + ndist
+            var lengths = List[Int](length=total, fill=0)
+            var i = 0
+            while i < total:
+                var sym = br.decode(ch)
+                var rep: Int
+                var fill = 0
+                if sym < 16:
+                    lengths[i] = sym
+                    i += 1
+                    continue
+                elif sym == 16:
+                    if i == 0:
+                        raise Error("inflate: repeat with no previous length")
+                    fill = lengths[i - 1]
+                    rep = 3 + br.bits(2)
+                elif sym == 17:
+                    rep = 3 + br.bits(3)
+                else:
+                    rep = 11 + br.bits(7)
+                if i + rep > total:
+                    raise Error("inflate: code-length overflow")
+                for _k in range(rep):
+                    lengths[i] = fill
+                    i += 1
+            var lit_lengths = List[Int](capacity=nlen)
+            for k in range(nlen):
+                lit_lengths.append(lengths[k])
+            var dist_lengths = List[Int](capacity=ndist)
+            for k in range(ndist):
+                dist_lengths.append(lengths[nlen + k])
+            var lh = _Huffman(lit_lengths)
+            var dh = _Huffman(dist_lengths)
+            _inflate_block(br, lh, dh, self.t, self.out)
+        else:
+            raise Error("inflate: reserved block type 3")
+        if final:
+            br.align()
+        self.pos = br.pos
+        self.bitbuf = br.bitbuf
+        self.bitcnt = br.bitcnt
+        return final
+
+
+# ── one-shot ───────────────────────────────────────────────────────────────
 
 
 def inflate(data: Span[UInt8, _]) raises -> List[UInt8]:
@@ -326,88 +668,10 @@ def inflate_at(data: Span[UInt8, _], mut end: Int) raises -> List[UInt8]:
     concatenated gzip members, for instance — need it to find the next one;
     callers that do not can use `inflate`.
     """
-    var out = _Out(len(data) * 3 + 64)
-    _inflate_into(data, end, out)
-    return out^.finish()
-
-
-def _inflate_into(data: Span[UInt8, _], mut end: Int, mut out: _Out) raises:
-    """`inflate_at`, appending to `out` rather than to a fresh buffer.
-
-    Back-references may reach back to `out.n` at the call, not before: what
-    `out` already holds belongs to an earlier stream."""
-    out.base = out.n
-    var t = _Tables()
-    var br = _BitReader(data)
-    var fixed_lit = _Huffman(_fixed_literal_lengths())
-    var fixed_dist = _Huffman(List[Int](length=30, fill=5))
-    while True:
-        var final = br.bits(1)
-        var btype = br.bits(2)
-        match btype:
-            case 0:
-                br.align()
-                if br.pos + 4 > len(br.data):
-                    raise Error("avro.deflate: truncated stored block header")
-                var length = Int(br.data[br.pos]) | (
-                    Int(br.data[br.pos + 1]) << 8
-                )
-                br.pos += 4  # LEN then its one's complement NLEN
-                if br.pos + length > len(br.data):
-                    raise Error("avro.deflate: truncated stored block")
-                out.extend(br.data[br.pos : br.pos + length])
-                br.pos += length
-            case 1:
-                _inflate_block(br, fixed_lit, fixed_dist, t, out)
-            case 2:
-                var nlen = br.bits(5) + 257
-                var ndist = br.bits(5) + 1
-                var ncode = br.bits(4) + 4
-                var clen = List[Int](length=19, fill=0)
-                for i in range(ncode):
-                    clen[t.clen_order[i]] = br.bits(3)
-                var ch = _Huffman(clen)
-                var lengths = List[Int](length=nlen + ndist, fill=0)
-                var i = 0
-                while i < nlen + ndist:
-                    var sym = br.decode(ch)
-                    if sym < 16:
-                        lengths[i] = sym
-                        i += 1
-                    elif sym == 16:
-                        if i == 0:
-                            raise Error(
-                                "avro.deflate: repeat with no previous length"
-                            )
-                        var prev = lengths[i - 1]
-                        var rep = 3 + br.bits(2)
-                        for _k in range(rep):
-                            lengths[i] = prev
-                            i += 1
-                    elif sym == 17:
-                        var rep = 3 + br.bits(3)
-                        i += rep
-                    else:
-                        var rep = 11 + br.bits(7)
-                        i += rep
-                if i > nlen + ndist:
-                    raise Error("avro.deflate: code-length overflow")
-                var lit_lengths = List[Int](capacity=nlen)
-                for k in range(nlen):
-                    lit_lengths.append(lengths[k])
-                var dist_lengths = List[Int](capacity=ndist)
-                for k in range(ndist):
-                    dist_lengths.append(lengths[nlen + k])
-                var lh = _Huffman(lit_lengths)
-                var dh = _Huffman(dist_lengths)
-                _inflate_block(br, lh, dh, t, out)
-            case _:
-                raise Error("avro.deflate: reserved block type 3")
-        if final:
-            break
-    # `br.pos` is the next byte not yet pulled into the bit buffer, so whole
-    # bytes still sitting in that buffer have not actually been consumed.
-    end = br.pos - br.bitcnt // 8
+    var inf = Inflater(len(data) * 3 + 64)
+    _ = inf.run(data, complete=True)
+    end = inf.input_used()
+    return inf^.finish()
 
 
 def _inflate_block(
@@ -419,8 +683,8 @@ def _inflate_block(
 ) raises:
     while True:
         # 258 is the longest match DEFLATE can emit, so one check per symbol
-        # covers whatever this iteration writes.
-        out.room(258)
+        # covers whatever this iteration writes (and the copy's overshoot).
+        out.room(_SLACK)
         var sym = br.decode(lit)
         if sym < 256:
             out.push(UInt8(sym))
@@ -429,18 +693,15 @@ def _inflate_block(
         else:
             var lc = sym - 257
             if lc >= 29:
-                raise Error("avro.deflate: invalid length symbol")
+                raise Error("inflate: invalid length symbol")
             var length = t.len_base[lc] + br.bits(t.len_extra[lc])
             var dc = br.decode(dist)
             if dc >= 30:
-                raise Error("avro.deflate: invalid distance symbol")
+                raise Error("inflate: invalid distance symbol")
             var d = t.dist_base[dc] + br.bits(t.dist_extra[dc])
             if d > out.n - out.base:
-                raise Error(
-                    "avro.deflate: distance runs before the output start"
-                )
+                raise Error("inflate: distance runs before the output start")
             out.copy_match(d, length)
-
 
 # ── compression ────────────────────────────────────────────────────────────
 

@@ -66,8 +66,7 @@ while pos < len(data):
     pos += end
 ```
 
-There is no streaming (chunked-output) form, because `inflate` has none: a
-member is decoded whole.
+To decode without holding the whole output, stream it (below).
 
 `gzip` writes one member with no name, comment or timestamp. Level 0 stores
 the data uncompressed; levels 1 to 9 all use `deflate`'s single
@@ -81,6 +80,45 @@ CPU).
 On an Apple M4, `gunzip` decodes a GH Archive hour (94 MB compressed, 670 MB
 of JSON) in 0.78 s, about 860 MB/s of output; Python's `zlib.decompress`
 takes 0.73 s and Apple's `gzip -d` 0.31 s.
+
+### Streaming
+
+`GzipReader` (gzip, every member) and `Inflater` (one raw DEFLATE stream)
+decode a window at a time, for output too large to hold whole — an hour of
+GH Archive is one 70 MB member of 490 MB of JSON. `run(data, complete,
+want)` decodes until the window, `output()`, holds `want` bytes, the input
+runs short, or the stream ends, and returns `InflateStatus.OUTPUT`,
+`NEED_INPUT` or `FINISHED`. `compact(k)` drops the first `k` bytes of the
+window once the caller has used them (the last 32 KiB stay, since
+back-references can reach that far) and returns how many went.
+
+```mojo
+from deflate import GzipReader, InflateStatus
+
+var gz = GzipReader()                    # GzipReader(multi_member=False): one member
+while True:
+    var st = gz.run(Span(data)[:have], complete, len(gz) + (1 << 20))
+    parse(gz.output())                   # everything decoded so far
+    _ = gz.compact(len(gz))              # done with it
+    if st == InflateStatus.FINISHED:
+        break
+    if st == InflateStatus.NEED_INPUT:
+        ...                              # wait for more of `data`
+```
+
+The input can still be arriving: `data` is what has come so far and
+`complete` says whether that is all of it. A block that runs past the end of
+`data` is rolled back and decoded again on a later call; so that this is
+rare, a block is only started with `MARGIN` (256 KiB) of input in hand,
+more than any block zlib writes. Input the decoder is done with can be
+dropped: `discard_input()` returns how many bytes at the front of `data` it
+no longer needs, and the next `run` is passed `data` without them, so a long
+download can go through a bounded buffer.
+
+The checks are `gunzip`'s, with the same messages; the CRC-32 is folded in
+as output is produced, so it covers bytes long since compacted away.
+`gunzip`, `gunzip_at`, `inflate` and `inflate_at` are these readers run once
+over the whole input, with a window that is never compacted.
 
 ### Raw means raw
 
