@@ -45,19 +45,17 @@ struct _Crc32(Movable):
     eight lookups)."""
 
     var table: List[UInt32]
-    """Flat 8 x 256; table k occupies [k*256, k*256 + 256)."""
+    """Flat 8 x 256; table k occupies [k*256, k*256 + 256). Empty where the
+    Arm instructions do the work, so a small `gunzip` does not pay for it."""
+
+    def __init__(out self, var table: List[UInt32]):
+        self.table = table^
 
     def __init__(out self):
-        self.table = List[UInt32](capacity=8 * 256)
-        for i in range(256):
-            var c = UInt32(i)
-            for _k in range(8):
-                c = (_CRC_POLY ^ (c >> 1)) if (c & 1) else (c >> 1)
-            self.table.append(c)
-        for k in range(1, 8):
-            for i in range(256):
-                var prev = self.table[(k - 1) * 256 + i]
-                self.table.append(self.table[Int(prev & 0xFF)] ^ (prev >> 8))
+        comptime if _ARM_CRC:
+            self.table = List[UInt32]()
+        else:
+            self.table = _crc_table()
 
     def update(self, crc_in: UInt32, data: Span[UInt8, _]) -> UInt32:
         """Continue `crc_in` (a finished CRC-32, 0 to start) over `data`."""
@@ -67,6 +65,8 @@ struct _Crc32(Movable):
 
     def table_update(self, crc_in: UInt32, data: Span[UInt8, _]) -> UInt32:
         """`update` through the slice-by-8 table, whatever the target."""
+        if len(self.table) == 0:
+            return _Crc32(_crc_table()).table_update(crc_in, data)
         var crc = ~crc_in
         var t = self.table.unsafe_ptr()
         var p = data.unsafe_ptr()
@@ -97,6 +97,20 @@ struct _Crc32(Movable):
             crc = t[unsafe_offset=k] ^ (crc >> 8)
             i += 1
         return ~crc
+
+
+def _crc_table() -> List[UInt32]:
+    var table = List[UInt32](capacity=8 * 256)
+    for i in range(256):
+        var c = UInt32(i)
+        for _k in range(8):
+            c = (_CRC_POLY ^ (c >> 1)) if (c & 1) else (c >> 1)
+        table.append(c)
+    for k in range(1, 8):
+        for i in range(256):
+            var prev = table[(k - 1) * 256 + i]
+            table.append(table[Int(prev & 0xFF)] ^ (prev >> 8))
+    return table^
 
 
 def _arm_crc32(crc_in: UInt32, data: Span[UInt8, _]) -> UInt32:
