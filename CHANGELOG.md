@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-05
+
 ### Added
 
 - **Streaming inflate** ([#8](https://github.com/magmalake/deflate.mojo/issues/8)).
@@ -30,6 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Matches whose distance is at least 8 are copied eight bytes at a time
   rather than byte by byte: `gunzip` of a GH Archive hour (70 MB to 491 MB)
   goes from 541 to 424 ms on an M4.
+- **A faster decode loop** ([#9](https://github.com/magmalake/deflate.mojo/issues/9)),
+  for every caller (one-shot and streaming). It refills the bit buffer once
+  per symbol, with no bounds checks while eight bytes of input remain. It
+  takes further literals from the same refill. Codes are looked up in a
+  10-bit first-level table (was 9) whose length and distance entries carry
+  their base and extra-bit count. Matches are copied 16 bytes at a time
+  when the distance allows, and runs of one byte are broadcast. Dynamic
+  blocks rebuild their Huffman tables in place instead of allocating them,
+  and the fixed tables, the RFC 1951 tables and the CRC-32 table (unused
+  where the Arm CRC instructions are) are built only when needed. On an M4,
+  `gunzip` of a GH Archive hour takes 336 ms (1.46 GB/s), from 553 ms in
+  0.1.3. avro.mojo's `bench_inflate` goes from 1.00 to 1.52 GB/s, and a
+  one-shot `inflate` of a small stream from 8.4 to 5.7 µs.
 - A stored block's NLEN is now checked against its LEN, and a dynamic block
   declaring more than 286 literal/length or 30 distance codes is refused.
 
