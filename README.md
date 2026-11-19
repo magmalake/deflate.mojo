@@ -162,8 +162,7 @@ boundary.
 ## Develop
 
 ```sh
-pixi run test    # nightly
-pixi run -e stable test
+pixi run test    # Mojo 1.3.0.dev2026111805
 pixi run lint
 ```
 

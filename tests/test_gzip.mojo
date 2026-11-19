@@ -22,12 +22,12 @@ comptime _DIR: StaticString = "tests/fixtures/"
 # ── helpers ────────────────────────────────────────────────────────────────
 
 
-def fixture(name: StringSlice) raises -> List[UInt8]:
+def fixture(name: StringSpan) raises -> List[UInt8]:
     with open(String(_DIR, name), "r") as f:
         return f.read_bytes()
 
 
-def bytes_of(text: StringSlice) -> List[UInt8]:
+def bytes_of(text: StringSpan) -> List[UInt8]:
     var out = List[UInt8]()
     for b in text.as_bytes():
         out.append(b)
@@ -35,7 +35,7 @@ def bytes_of(text: StringSlice) -> List[UInt8]:
 
 
 def assert_bytes_equal(
-    got: Span[UInt8, _], want: Span[UInt8, _], name: StringSlice
+    got: Span[UInt8, _], want: Span[UInt8, _], name: StringSpan
 ) raises:
     assert_equal(len(got), len(want), String(name, ": length"))
     for i in range(len(want)):
@@ -44,7 +44,7 @@ def assert_bytes_equal(
 
 
 def assert_gunzip_raises(
-    data: Span[UInt8, _], needle: StringSlice, name: StringSlice
+    data: Span[UInt8, _], needle: StringSpan, name: StringSpan
 ) raises:
     """`gunzip(data)` raises, and the message names the problem."""
     var message = String()
@@ -59,7 +59,7 @@ def assert_gunzip_raises(
     )
 
 
-def text_fixture(name: StringSlice) raises:
+def text_fixture(name: StringSpan) raises:
     var got = gunzip(Span(fixture(name)))
     assert_bytes_equal(Span(got), Span(bytes_of(_TEXT)), name)
 

@@ -30,13 +30,13 @@ comptime _DIR: StaticString = "tests/fixtures/"
 # ── helpers ────────────────────────────────────────────────────────────────
 
 
-def fixture(name: StringSlice) raises -> List[UInt8]:
+def fixture(name: StringSpan) raises -> List[UInt8]:
     with open(String(_DIR, name), "r") as f:
         return f.read_bytes()
 
 
 def assert_bytes_equal(
-    got: Span[UInt8, _], want: Span[UInt8, _], name: StringSlice
+    got: Span[UInt8, _], want: Span[UInt8, _], name: StringSpan
 ) raises:
     assert_equal(len(got), len(want), String(name, ": length"))
     for i in range(len(want)):
@@ -173,7 +173,7 @@ def _mixed_gzip() raises -> List[UInt8]:
 
 
 def _raises_gzip(
-    data: List[UInt8], var sizes: _Sizes, needle: StringSlice, name: StringSlice
+    data: List[UInt8], var sizes: _Sizes, needle: StringSpan, name: StringSpan
 ) raises:
     var message = String()
     try:
