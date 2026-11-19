@@ -24,14 +24,14 @@ from deflate.raw import (
 # ── helpers ────────────────────────────────────────────────────────────────
 
 
-def bytes_of(text: StringSlice) -> List[UInt8]:
+def bytes_of(text: StringSpan) -> List[UInt8]:
     var out = List[UInt8]()
     for b in text.as_bytes():
         out.append(b)
     return out^
 
 
-def parse_bytes(text: StringSlice) raises -> List[UInt8]:
+def parse_bytes(text: StringSpan) raises -> List[UInt8]:
     """Decode a comma-separated byte list — how the zlib fixtures are spelled."""
     var out = List[UInt8]()
     for part in text.split(","):
@@ -40,7 +40,7 @@ def parse_bytes(text: StringSlice) raises -> List[UInt8]:
 
 
 def assert_bytes_equal(
-    got: Span[UInt8, _], want: Span[UInt8, _], name: StringSlice
+    got: Span[UInt8, _], want: Span[UInt8, _], name: StringSpan
 ) raises:
     assert_equal(len(got), len(want), String(name, ": length"))
     for i in range(len(want)):
@@ -184,7 +184,7 @@ def test_garbage_block_type_raises() raises:
     assert_true(raised, "reserved block type should raise")
 
 
-def _same(got: List[Int], want: List[Int], name: StringSlice) raises:
+def _same(got: List[Int], want: List[Int], name: StringSpan) raises:
     assert_equal(len(got), len(want), String(name, ": length"))
     for k in range(len(want)):
         assert_equal(got[k], want[k], String(name, ": entry ", k))

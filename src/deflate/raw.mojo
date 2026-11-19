@@ -38,7 +38,7 @@ comptime _CLEN_ORDER_S: StaticString = (
 )
 
 
-def _ints(text: StringSlice) raises -> List[Int]:
+def _ints(text: StringSpan) raises -> List[Int]:
     var out = List[Int]()
     for part in text.split(","):
         out.append(Int(String(part)))
@@ -821,7 +821,6 @@ def _codes(
     `_codes_checked`."""
     var n = out.n
     var limit = len(out.buf) - _SLACK
-    var p = out.buf.unsafe_ptr()
     var ip = br.data.unsafe_ptr()
     var in_n = len(br.data)
     var bitbuf = br.bitbuf
@@ -847,7 +846,9 @@ def _codes(
             out.n = n
             out.room(_SLACK)
             limit = len(out.buf) - _SLACK
-            p = out.buf.unsafe_ptr()
+        # Taken after the `room` above, every symbol: `room` may move the
+        # buffer, and the compiler accepts only a pointer formed after it.
+        var p = out.buf.unsafe_ptr()
         # Refill: one unaligned little-endian load (every target this builds
         # for is little-endian), topping the buffer up to 56..63 bits.
         var chunk = (

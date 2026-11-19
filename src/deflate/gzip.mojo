@@ -155,12 +155,12 @@ def _u32le(data: Span[UInt8, _], at: Int) -> UInt32:
     )
 
 
-def _err(member: Int, at: Int, what: StringSlice) -> Error:
+def _err(member: Int, at: Int, what: StringSpan) -> Error:
     return Error(String("gunzip: member ", member, " at byte ", at, ": ", what))
 
 
 def _skip_zstring(
-    data: Span[UInt8, _], var i: Int, member: Int, start: Int, what: StringSlice
+    data: Span[UInt8, _], var i: Int, member: Int, start: Int, what: StringSpan
 ) raises -> Int:
     """Offset just past the NUL that ends a FNAME or FCOMMENT field."""
     while i < len(data) and data[i] != 0:
