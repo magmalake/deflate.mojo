@@ -1,6 +1,6 @@
 # deflate.mojo
 
-[![mojoshelf](https://mojoshelf.org/badge/deflate-mojo.svg)](https://mojoshelf.org/tins/deflate-mojo) [![mojo nightly](https://mojoshelf.org/badge/deflate-mojo/nightly.svg)](https://mojoshelf.org/tins/deflate-mojo)
+[![mojoshelf](https://mojoshelf.org/badge/deflate-mojo.svg)](https://mojoshelf.org/tins/deflate-mojo) [![mojo nightly](https://mojoshelf.org/badge/deflate-mojo/nightly.svg)](https://mojoshelf.org/tins/deflate-mojo) [![Used by](https://mojourney.dev/badge/magmalake/deflate.mojo/used-by.svg)](https://mojourney.dev/repos/magmalake/deflate.mojo#used-by) [![Mojo version](https://mojourney.dev/badge/magmalake/deflate.mojo/mojo.svg)](https://mojourney.dev/repos/magmalake/deflate.mojo)
 
 > Part of [**magmalake**](https://magmalake.dev) — data lake building blocks in Mojo.
 
